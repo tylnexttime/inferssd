@@ -45,6 +45,7 @@ from inferssd.machine.characteristics import (
     Storage,
 )
 from inferssd.machine.identity import (
+    TIER_BACKENDS,
     Drive,
     GPUQueryFailed,
     Host,
@@ -448,9 +449,9 @@ def measure_gpus(
         return [], section(start, clock(), "nvidia-smi", "failed", failure)
     if "memory" not in identity["soft"]["probe_versions"]:
         why = (
-            "the GPU transfer probe needs an NVIDIA GPU with CUDA"
+            "the GPU transfer probe needs a GPU on CUDA or ROCm"
             if identity["hard"]["platform"] == "darwin"
-            else "no NVIDIA GPU found by nvidia-smi"
+            else "no GPU on CUDA (nvidia-smi) or ROCm (amdkfd) found"
         )
         return [], section(start, clock(), "none", "ok", why)
     progress("GPU probe: VRAM size and transfer rates")
@@ -461,12 +462,12 @@ def measure_gpus(
         return [], section(start, clock(), method, "failed", str(error))
     gpus = gpu_rows(report)
     if not gpus:
-        return [], section(start, clock(), method, "failed", "the probe found no CUDA device")
+        return [], section(start, clock(), method, "failed", "the probe found no GPU")
     measured = {gpu["uuid"].lower() for gpu in gpus}
     missing = [
         gpu["uuid"]
         for gpu in identity["hard"]["gpus"]
-        if gpu["backend"] == "CUDA" and gpu["uuid"].lower() not in measured
+        if gpu["backend"] in TIER_BACKENDS and gpu["uuid"].lower() not in measured
     ]
     reasons = [f"device {index}: {why}" for index, why in sorted(skipped_devices(report).items())]
     notes = []
@@ -497,13 +498,52 @@ def measure_drive(
             f"({drive.bus})"
         )
         method = f"{PROBE_SCHEMAS['ssd']} read-only random extents in {len(chosen)} existing files"
-        return _read_rates(drive, chosen, method, probes, clock, start)
+        try:
+            return _read_rates(drive, chosen, method, probes, clock, start, cached_raises=True)
+        except ProbeError:
+            # Every given file is in the page cache: a model written moments ago, on a
+            # machine with memory to spare. The probe skips cached pages on macOS, since
+            # reading them would measure memory, so the drive is measured in a test file
+            # beside the model instead. Before this the section failed, and every launch
+            # failed it again until the pages were evicted.
+            progress("SSD probe: every given file is in the page cache; measuring in a test file")
+            os_path = ntpath if host.platform() == "windows" else posixpath
+            directory = os_path.dirname(chosen[0])
+            # No given directory clears a test file a killed run left beside the model.
+            host.clear_test_files(directory)
+            return _test_file_rates(
+                host,
+                drive,
+                directory,
+                "every given file is in the page cache",
+                probes,
+                clock,
+                start,
+                progress,
+                cached=True,
+            )
     largest = max((size for _, size in place.files), default=0)
     reason = f"no file of at least {MIN_FILE_BYTES} bytes on this drive among the given paths"
     if not place.directories:
         detail = f"{reason} (largest {largest} bytes)"
         return None, section(start, clock(), "none", "failed", detail)
-    directory = place.directories[0]
+    return _test_file_rates(
+        host, drive, place.directories[0], reason, probes, clock, start, progress
+    )
+
+
+def _test_file_rates(
+    host: Host,
+    drive: Drive,
+    directory: str,
+    reason: str,
+    probes: Probes,
+    clock: Clock,
+    start: float,
+    progress: Progress,
+    cached: bool = False,
+) -> tuple[Optional[Storage], Section]:
+    """Read rates in a test file written to DIRECTORY, because of REASON."""
     free = host.free_bytes(directory)
     if free < TEST_FILE_BYTES + MIN_FILE_BYTES:
         return None, section(
@@ -521,12 +561,17 @@ def measure_drive(
     method = (
         f"{PROBE_SCHEMAS['ssd']} random extents in a {TEST_FILE_BYTES}-byte test file of "
         "random data, removed after"
-    )
+    ) + (", since the given files were in the page cache" if cached else "")
     try:
         with host.test_file(directory, TEST_FILE_BYTES) as path:
             return _read_rates(drive, [path], method, probes, clock, start)
     except OSError as error:
         return None, section(start, clock(), method, "failed", f"the test file failed: {error}")
+
+
+def _in_page_cache(error: ProbeError) -> bool:
+    """The SSD probe found no extent to read outside the page cache (ssdprobe.cpp, status 2)."""
+    return error.status == 2 and "outside the page cache" in error.reason
 
 
 def _read_rates(
@@ -536,12 +581,15 @@ def _read_rates(
     probes: Probes,
     clock: Clock,
     start: float,
+    cached_raises: bool = False,
 ) -> tuple[Optional[Storage], Section]:
     try:
         entry = storage_entry(
             probes.run("ssd", [argument for path in paths for argument in ("--file", path)]), drive
         )
     except ProbeError as error:
+        if cached_raises and _in_page_cache(error):
+            raise
         return None, section(start, clock(), method, "failed", str(error))
     if not entry["random_read"]:
         return None, section(start, clock(), method, "failed", "the probe measured no point")

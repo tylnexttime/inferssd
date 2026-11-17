@@ -3,11 +3,11 @@
 
 ``derive`` is a pure function of the machine characteristics, the model's
 header facts, the runtime facts and the platform. It chooses thread counts and
-CPU placement, placement cost priors, the host memory budget and margin, and,
-where the engine has a GPU expert tier, which prompt passes the GPU graph
-prefills and that a prompt is prefilled in one pass. The last two change the
-computation (GPU against CPU kernels, the pass shape) for speed; everything else
-keeps it bit-exact. The VRAM budget's behaviour stays as the engine has it.
+CPU placement, placement cost priors, and the host memory budget and margin; a
+launch with a strategy prefills each prompt in one pass.
+The pass shape changes the computation, for speed; everything else keeps it
+bit-exact. Every prompt pass takes the engine's own route, the SSD sink, and the
+VRAM budget's behaviour stays as the engine has it.
 
 Which settings apply on a platform comes from the settings registry's scopes, so
 every platform runs this one derivation.
@@ -19,7 +19,7 @@ import hashlib
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Optional
 
 from inferssd.configuration.settings import (
     PLATFORMS,
@@ -33,7 +33,8 @@ from inferssd.configuration.settings import (
 )
 from inferssd.launch.types import Threads
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow, dumps
-from inferssd.strategy.inputs import ModelFacts, RuntimeFacts
+from inferssd.machine.identity import TIER_BACKENDS
+from inferssd.strategy.inputs import GPUState, ModelFacts, RuntimeFacts
 
 # The engine's GB/s cost terms are 1e9 bytes per second: it prices a copy or a
 # read at 1e3 / gbps microseconds per 1e6 bytes.
@@ -54,8 +55,6 @@ UNIFIED_HEADROOM_MIB = 4096
 # grow into. A GPU this launch has to itself keeps nothing back: that memory would
 # only cost expert slots.
 SHARED_GPU_RESERVE_MIB = 1024
-# The longest prompt pass the prefill route is priced for.
-MAX_PASS = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -80,8 +79,6 @@ class Strategy:
     server_args: tuple[str, ...]
     inputs: Inputs
     notes: tuple[str, ...]
-    # Prefill each prompt in one pass: -b and -ub as large as the context.
-    one_pass: bool = False
 
 
 def span(cpus: Sequence[int]) -> str:
@@ -115,6 +112,24 @@ def engine_gpu_backends(
     if characteristics is None:
         return frozenset()
     return frozenset(gpu["backend"] for gpu in characteristics["identity"]["hard"]["gpus"])
+
+
+def tier_backends(
+    known: Optional[Sequence[str]], characteristics: Optional[Characteristics]
+) -> list[str]:
+    """The launch engine's backends that carry the expert VRAM tier (identity.TIER_BACKENDS)."""
+    backends = engine_gpu_backends(known, characteristics)
+    return [backend for backend in TIER_BACKENDS if backend in backends]
+
+
+def tier_gpus(
+    runtime: RuntimeFacts, characteristics: Optional[Characteristics]
+) -> Optional[tuple[GPUState, ...]]:
+    """The GPUs the launch engine's VRAM tier can use now, None when they cannot be read."""
+    if runtime.gpus is None:
+        return None
+    backends = tier_backends(runtime.gpu_backends, characteristics)
+    return tuple(gpu for gpu in runtime.gpus if gpu.backend in backends)
 
 
 def _validated(choices: Mapping[str, tuple[str, str]], platform: str) -> dict[str, Choice]:
@@ -535,13 +550,14 @@ def link_rates(
     characteristics: Characteristics, runtime: RuntimeFacts
 ) -> tuple[dict[str, float], str]:
     """Pinned and pageable host-to-device rates in GB/s at the largest measured copy."""
-    if runtime.gpus is None:
-        return {}, "the CUDA GPUs could not be read now"
-    present = runtime.gpus
+    present = tier_gpus(runtime, characteristics)
+    names = "/".join(tier_backends(runtime.gpu_backends, characteristics)) or "tier"
+    if present is None:
+        return {}, f"the {names} GPUs could not be read now"
     if len(present) != 1:
         if not present:
-            return {}, "no CUDA GPU is usable now"
-        return {}, f"{len(present)} CUDA GPUs are usable and the engine drives one of them"
+            return {}, f"no {names} GPU is usable now"
+        return {}, f"{len(present)} {names} GPUs are usable and the engine drives one of them"
     gpu = next((row for row in characteristics["gpus"] if row["uuid"] == present[0].uuid), None)
     if gpu is None:
         return {}, f"the GPU {present[0].uuid} was not measured"
@@ -563,54 +579,6 @@ def link_rates(
     return terms, f"{gpu['name']} host-to-device " + (", ".join(parts) or "not measured")
 
 
-def prefill_split(
-    model: ModelFacts, line: tuple[float, float], drive_gbps: float, io_gbps: float
-) -> tuple[Optional[int], str]:
-    """The longest prompt pass the CPU prefills faster than the GPU graph, and why.
-
-    A pass of n tokens touches U(n) = E (1 - (1 - k/E)^n) of a layer's E
-    experts when each token routes to k of them uniformly. The CPU route reads
-    those experts from the drive while it computes them, n k routes a layer on
-    the CPU line, so it takes the longer of the two; the graph reads the same
-    experts into the GPU at the slower of the drive and the link, and its
-    compute is taken as free. Only a link slower than the drive leaves the CPU
-    faster, for short passes while U(n) still grows with n, and slower past the
-    crossing. A tie goes to the graph: it leaves those experts in the VRAM tier,
-    which decode reads next. None when the GPU never wins within MAX_PASS tokens.
-    """
-    k = model.experts_used
-    E, L, B = model.experts, model.layers, model.mean_expert_read_bytes
-    fixed, route = line
-    if not k:
-        return None, "the GGUF header gives no experts per token"
-
-    def cpu_faster(n: int) -> bool:
-        touched = L * E * (1 - (1 - k / E) ** n)
-        read = touched * B / (drive_gbps * GB)
-        cpu = (touched * fixed + n * k * L * route) * 1e-6
-        return max(read, cpu) < touched * B / (io_gbps * GB)
-
-    why = (
-        f"{L} layers of {E} experts, {k} a token, {size(B)} read an expert; CPU {fixed:.1f} + "
-        f"{route:.2f} us a route reading {drive_gbps:.2f} GB/s, "
-        f"GPU graph reading {io_gbps:.2f} GB/s"
-    )
-    if not cpu_faster(1):
-        return 0, why
-    lo, hi = 1, 2
-    while cpu_faster(hi):
-        lo, hi = hi, hi * 2
-        if hi > MAX_PASS:
-            return None, why + f": the CPU is faster up to {MAX_PASS} tokens"
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if cpu_faster(mid):
-            lo = mid
-        else:
-            hi = mid
-    return lo, why
-
-
 def _costs(terms: Mapping[str, float], reasons: Sequence[str]) -> Optional[tuple[str, str]]:
     if not terms:
         return None
@@ -619,12 +587,13 @@ def _costs(terms: Mapping[str, float], reasons: Sequence[str]) -> Optional[tuple
 
 
 def single_gpu(characteristics: Characteristics, runtime: RuntimeFacts) -> Optional[GPU]:
-    """The profiled GPU when it is the one CUDA GPU the launch can use."""
+    """The profiled GPU when it is the one GPU the launch engine's VRAM tier can use."""
+    present = tier_gpus(runtime, characteristics)
     return next(
         (
             row
             for row in characteristics["gpus"]
-            if runtime.gpus and len(runtime.gpus) == 1 and row["uuid"] == runtime.gpus[0].uuid
+            if present and len(present) == 1 and row["uuid"] == present[0].uuid
         ),
         None,
     )
@@ -694,23 +663,25 @@ def derive(
     if costs is not None:
         choices["place.costs"] = costs
 
-    one_pass = False
-    # The CUDA tier's budget, where the engine has the tier. A GPU lane (Vulkan, Metal) takes
-    # the default.
-    if "CUDA" in engine_gpu_backends(runtime.gpu_backends, characteristics):
+    # The VRAM tier's budget, where the engine has the tier (CUDA, ROCm). A GPU lane (Vulkan,
+    # Metal) takes the default.
+    tier = tier_backends(runtime.gpu_backends, characteristics)
+    if tier:
         listed = {
             gpu["uuid"]
             for gpu in characteristics["identity"]["hard"]["gpus"]
-            if gpu["backend"] == "CUDA"
+            if gpu["backend"] in tier
         }
-        if runtime.gpus is None:
-            notes.append("vram.budget: default; the CUDA GPUs could not be read now")
-        elif not runtime.gpus:
+        usable = tier_gpus(runtime, characteristics)
+        names = "/".join(tier)
+        if usable is None:
+            notes.append(f"vram.budget: default; the {names} GPUs could not be read now")
+        elif not usable:
             extra = f", although the machine has {len(listed)}" if listed else ""
-            choices["vram.budget"] = ("0", "no CUDA GPU is usable now" + extra)
-            notes.append("vram.budget: 0, no CUDA GPU is usable now" + extra)
+            choices["vram.budget"] = ("0", f"no {names} GPU is usable now" + extra)
+            notes.append(f"vram.budget: 0, no {names} GPU is usable now" + extra)
         else:
-            known = [gpu for gpu in runtime.gpus if gpu.uuid in listed]
+            known = [gpu for gpu in usable if gpu.uuid in listed]
             if known:
                 notes.append("vram.budget: default auto for " + ", ".join(g.uuid for g in known))
             else:
@@ -720,7 +691,7 @@ def derive(
                 )
             busy = [
                 f"{gpu.uuid} runs {gpu.processes} compute process(es)"
-                for gpu in runtime.gpus
+                for gpu in usable
                 if gpu.processes
             ]
             if busy:
@@ -736,34 +707,20 @@ def derive(
                 "stress with the automatic VRAM tier",
             )
             notes.append(f"host.headroom_mib: {UNIFIED_HEADROOM_MIB}, the GPU shares host memory")
-        rates = (
-            None
-            if device is None or line is None or drive is None
-            else (
-                drive,
-                drive if device["integrated"] else min(drive, link.get("link_gbps", drive)),
-            )
+        # Every pass takes the SSD sink. It reads each expert a pass routes to once, from the VRAM
+        # tier, the RAM cache or the drive, places it on the CPU or the GPU by place.costs, and
+        # seeds the VRAM tier for decode.
+        notes.append(
+            "prefill: the SSD sink for every pass; it reads only what the VRAM tier and the "
+            "RAM cache do not hold"
         )
-        if rates is None:
-            notes.append(
-                "prefill: the CPU route for every pass and passes of the launch's batch; "
-                "no single profiled CUDA GPU with a CPU line and a drive rate"
-            )
-        else:
-            split, why = prefill_split(model, cast(tuple[float, float], line), *rates)
-            if split is None:
-                notes.append("prefill: the CPU route for every pass; " + why)
-            else:
-                choices["prefill.cpu_max_tokens"] = (
-                    str(split),
-                    f"the longest pass the CPU prefills faster than the GPU graph: {why}",
-                )
-                notes.append(f"prefill.cpu_max_tokens: {split}; {why}")
-            one_pass = True
-            notes.append(
-                "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads "
-                "every expert it routes to once"
-            )
+    # A prompt in one pass, on every platform: a pass reads every expert it routes to once,
+    # whatever computes it. The engine reserves each prompt's own graph, a smaller one where that
+    # does not fit, and the expert caches give back what it needs.
+    notes.append(
+        "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads every "
+        "expert it routes to once"
+    )
     if offered("host.budget_mib", platform) and runtime.memory_budget_bytes:
         mib = runtime.memory_budget_bytes >> 20
         if mib:
@@ -779,5 +736,4 @@ def derive(
         server_args=SERVER_ARGS,
         inputs=Inputs(hashlib.sha256(text.encode()).hexdigest(), model.paths, platform),
         notes=tuple(notes),
-        one_pass=one_pass,
     )

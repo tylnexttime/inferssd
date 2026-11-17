@@ -128,8 +128,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    if (GGML_CUDA_KIMI_VRAM_TIER)
-        target_sources(ggml-cuda PRIVATE ssd/group-matmul.cu)
+    if (GGML_CUDA_SSD_VRAM_TIER)
+        set(SSD_GPU_BACKEND ggml-cuda)
+        set(SSD_GPU_LANGUAGE CUDA)
+        set(SSD_GPU_RUNTIME CUDA::cudart)
         add_subdirectory(ssd)
     endif()
 

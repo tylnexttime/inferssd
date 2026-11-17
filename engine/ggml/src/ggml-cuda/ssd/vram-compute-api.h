@@ -2,9 +2,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "export.h"
-#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
+#include "ggml-ssd/gpu/vram-tier-api.h"
+#include "gpu-runtime.h"
 struct vram_compute_expert { const void * up; const void * gate; const void * down; };
-struct CUevent_st;
 // Decode engine of the tier (generic-compute-adapter.cu): an f32 input row, up and gate, the activation and down over
 // up to max_hits experts of one format on the CUDA backend's matrix-vector kernels; returns unweighted down rows.
 // compute runs a call and waits for it (grouped prefill's one-token passes, on the tier's worker). launch queues one
@@ -16,12 +16,12 @@ struct vram_format_compute_api {
     void * (*create)(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, char *, size_t);
     void (*destroy)(void *);
     int (*compute)(void *, const vram_compute_expert *, int hits, const void * input, size_t input_bytes,
-                   const kimi_vram_activation * activation, float * host_down, char * error, size_t error_size);
+                   const ssd_vram_activation * activation, float * host_down, char * error, size_t error_size);
     size_t (*device_scratch_bytes)(void *);
     size_t (*host_scratch_bytes)(void *);
     int (*launch)(void *, const vram_compute_expert *, int hits, int first, const void * input, size_t input_bytes,
-                  const kimi_vram_activation * activation, struct CUevent_st * ready, struct CUevent_st * start,
-                  struct CUevent_st * end, char * error, size_t error_size);
+                  const ssd_vram_activation * activation, cudaEvent_t ready, cudaEvent_t start, cudaEvent_t end,
+                  char * error, size_t error_size);
     const float * (*host_rows)(void *); // [max_hits][latent]
 };
 typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
@@ -35,7 +35,7 @@ typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
 // (before decode grows the tier). The kernels stay loaded for the process: the first reserve of a type and shape takes
 // their device memory for good, and meanwhile a scratch of one matrix and its operands, which it frees.
 struct vram_group_activation {
-    struct kimi_vram_activation base;
+    struct ssd_vram_activation base;
     const float * post_norm;    // latent weights of the per-expert post norm, or null; copied by begin_layer
     float post_norm_eps;
 };
@@ -83,8 +83,8 @@ struct vram_group_compute_api {
     // Queues group g's chain with these weights. The chain waits for `ready` (a weights upload, or null) on the device;
     // *done (optional) receives an event that completes when the chain no longer reads the weights, valid until the
     // next begin_layer.
-    int (*compute)(void *, int group, const struct vram_compute_expert * weights, struct CUevent_st * ready,
-                   struct CUevent_st ** done, char * error, size_t error_size);
+    int (*compute)(void *, int group, const struct vram_compute_expert * weights, cudaEvent_t ready,
+                   cudaEvent_t * done, char * error, size_t error_size);
     // Waits for the layer and returns its accumulated rows [rows][latent] (page-locked, valid until the next
     // begin_layer) and the layer's stats; group_us (optional, one per group) each chain's time. Every group of the
     // layer must have been computed.
@@ -97,6 +97,6 @@ struct vram_group_compute_api {
 typedef const vram_group_compute_api * (*vram_group_compute_get_api_fn)();
 
 extern "C" {
-const vram_format_compute_api * kimi_vram_generic_format_compute_get_api();
-SSD_CUDA_EXPORT const vram_group_compute_api * kimi_vram_group_compute_get_api();
+const vram_format_compute_api * ssd_vram_generic_format_compute_get_api();
+SSD_CUDA_EXPORT const vram_group_compute_api * ssd_vram_group_compute_get_api();
 }

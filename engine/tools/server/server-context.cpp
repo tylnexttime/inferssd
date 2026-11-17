@@ -121,6 +121,9 @@ struct server_slot {
     std::unique_ptr<const server_task> task;
     std::unique_ptr<const server_task> task_prev; // used for debugging
 
+    // usage record of the running task, taken from the task at launch
+    server_usage_request_ptr usage;
+
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
@@ -467,9 +470,24 @@ struct server_slot {
         server_moe_phase_report(ctx, "request_end", request_task_id);
     }
 
+    // Hand the running task's counts to its usage record, once. The prompt counts as the usage field reports it;
+    // a child shares its parent's prompt, so only the parent counts it. n_decoded holds the previous task's count
+    // until this task's prompt is done.
+    void collect_usage() {
+        if (!usage) {
+            return;
+        }
+        if (task && is_processing()) {
+            const bool decoding = state == SLOT_STATE_DONE_PROMPT || state == SLOT_STATE_GENERATING;
+            usage->add(task->is_child() ? 0 : task->n_tokens(), decoding ? n_decoded : 0);
+        }
+        usage.reset();
+    }
+
     void release() {
         end_request();
         prompt_batch.row_end = -1;
+        collect_usage();
 
         if (is_processing()) {
             GGML_ASSERT(task);
@@ -710,6 +728,21 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
+
+    // usage events for the host, or nullptr when INFERSSD_USAGE_DIR is unset
+    const std::shared_ptr<server_usage_log> usage_log = server_usage_log::from_environment();
+
+    // only after the main loop has stopped: the running tasks' counts go to their records, then every open
+    // record is written as it stands
+    void finish_usage() {
+        if (!usage_log) {
+            return;
+        }
+        for (auto & slot : slots) {
+            slot.collect_usage();
+        }
+        usage_log->finish_open();
+    }
 
     ~server_context_impl() {
         if (!sleeping) {
@@ -1021,6 +1054,8 @@ private:
         slots.clear();
 
         const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
+        // the load's passes are done: the SSD expert caches take their experts before any request
+        server_ssd_preload(ctx);
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -1564,7 +1599,8 @@ private:
 
 
 
-        slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.usage = std::move(task.usage);
+        slot.task  = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2115,16 +2151,26 @@ private:
                     add_checkpoint(slot, std::move(checkpoint));
                 }
             }
-            if (shared && prompt_cache) {
-                server_prompt prefix;
-                prefix.tokens = slot.prompt.tokens.clone();
-                prefix.tokens.keep_first(n);
-                SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
-                prompt_cache->save(prefix, false, ctx, slot.id, slot.ctx_seq_rm_type);
-                llama_ssd_host_note_memory_change(ctx);
-                prompt_cache->update();
+            if (shared) {
+                keep_shared_prefix(slot, n, false);
             }
         }
+    }
+
+    // Puts the first `n` prompt tokens of the slot, the prompt part other conversations share, in the prompt cache,
+    // where a conversation started later, or after a restart, finds it: with the sequence's current state (current,
+    // which must be the state after them) or with the earlier state a memory that can save one has after them.
+    void keep_shared_prefix(server_slot & slot, int64_t n, bool current) {
+        if (!prompt_cache) {
+            return;
+        }
+        server_prompt prefix;
+        prefix.tokens = slot.prompt.tokens.clone();
+        prefix.tokens.keep_first(n);
+        SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
+        prompt_cache->save(prefix, current, ctx, slot.id, slot.ctx_seq_rm_type);
+        llama_ssd_host_note_memory_change(ctx);
+        prompt_cache->update();
     }
 
     // Room for a new checkpoint of `bytes`, made before it is allocated: the oldest checkpoint goes when the slot
@@ -3121,30 +3167,22 @@ private:
 
                         slot.n_prompt_tokens_processed++;
 
-                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
-                                }
-                            }
-                            if (should_break) {
-                                break;
-                            }
+                        // A memory that can only be checkpointed between batches stops the batch at the places
+                        // checkpoint_decoded_prompt() keeps. Upstream also stops n_ubatch tokens earlier
+                        // (ggml-org/llama.cpp#20288), for a checkpoint that the end one replaces at once with
+                        // --ctx-checkpoints 1; each extra prompt batch streams the experts again.
+                        if (do_checkpoint && server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                                                       slot.task->n_shared_prefix, n_batch)) {
+                            break;
                         }
                     }
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
+
+                    // the batch starts at the end of the shared prefix, where the one before it stopped
+                    const bool at_shared = do_checkpoint && slot.task->n_shared_prefix >= 64 &&
+                        slot.prompt.n_tokens() - n_tokens_cur == slot.task->n_shared_prefix;
 
                     if (checkpoint_after_decode && n_tokens_cur > 0 && !has_mtmd) {
                         slot.prompt_batch.n0      = slot.prompt.n_tokens() - n_tokens_cur;
@@ -3167,8 +3205,8 @@ private:
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
                     } else {
-                        if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
-                            // near the end of the prompt
+                        if (at_shared || slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
+                            // after the shared prefix, or near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
                         } else {
                             // only do non-end checkpoints if the "checkpoint every n tokens" option is set
@@ -3208,6 +3246,11 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+                    // The state is still the one after the shared prefix, computed by this task rather than reused
+                    // (the prompt cache holds those already); a later checkpoint may push its own out.
+                    if (at_shared && slot.n_prompt_tokens_cache < slot.task->n_shared_prefix && pos_min >= 0 && !has_mtmd) {
+                        keep_shared_prefix(slot, slot.task->n_shared_prefix, true);
                     }
                 }
 
@@ -3628,6 +3671,10 @@ void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
 
+void server_context::finish_usage() {
+    impl->finish_usage();
+}
+
 llama_context * server_context::get_llama_context() const {
     return impl->ctx;
 }
@@ -3684,6 +3731,7 @@ server_context_meta server_context::get_meta() const {
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_http_res {
     server_response_reader rd;
+    server_usage_request_ptr usage;
     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
         // fast path in case sleeping is disabled
@@ -3716,12 +3764,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type) {
+            task_response_type res_type,
+            server_usage_request_ptr usage) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
+    res->usage = usage;
+    const auto set_outcome = [&usage](server_usage_outcome outcome) {
+        if (usage) {
+            usage->set_outcome(outcome);
+        }
+    };
 
     try {
         std::vector<server_task> tasks;
@@ -3766,6 +3821,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
             task.id_slot = json_value(data, "id_slot", -1);
+            task.usage   = usage;
 
             // OAI-compat
             task.params.res_type          = res_type;
@@ -3784,6 +3840,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         rd.post_tasks(std::move(tasks));
+        // from here a request that does not reach its end was cancelled
+        set_outcome(SERVER_USAGE_CANCELLED);
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -3797,9 +3855,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         if (all_results.is_terminated) {
             return res; // connection is closed
         } else if (all_results.error) {
+            set_outcome(SERVER_USAGE_FAILED);
             res->error(all_results.error->to_json());
             return res;
         } else {
+            set_outcome(SERVER_USAGE_COMPLETED);
             json arr = json::array();
             for (auto & res : all_results.results) {
                 GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
@@ -3832,6 +3892,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         if (first_result->is_error()) {
+            set_outcome(SERVER_USAGE_FAILED);
             res->error(first_result->to_json());
             return res;
         }
@@ -3882,6 +3943,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
                 // check if there is more data
                 if (!rd.has_next()) {
+                    if (res_this->usage) {
+                        res_this->usage->set_outcome(SERVER_USAGE_COMPLETED);
+                    }
                     switch (res_type) {
                         case TASK_RESPONSE_TYPE_NONE:
                         case TASK_RESPONSE_TYPE_OAI_RESP:
@@ -3907,6 +3971,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
                 // send the results
                 if (result->is_error()) {
+                    if (res_this->usage) {
+                        res_this->usage->set_outcome(SERVER_USAGE_FAILED);
+                    }
                     json res_json = result->to_json();
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
@@ -3930,6 +3997,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 return true;
 
             } catch (const std::exception & e) {
+                if (res_this->usage) {
+                    res_this->usage->set_outcome(SERVER_USAGE_FAILED);
+                }
                 json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
                 output = format_error(res_type, error_json);
 
@@ -3940,6 +4010,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     }
 
     return res;
+}
+
+server_usage_request_ptr server_routes::begin_usage() const {
+    return ctx_server.usage_log ? ctx_server.usage_log->begin() : nullptr;
 }
 
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
@@ -4304,6 +4378,8 @@ void server_routes::init_routes() {
 
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
+        // counted before the body is read, so a request that fails to parse still counts
+        auto usage = begin_usage();
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
@@ -4311,11 +4387,14 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body,
             files,
-            TASK_RESPONSE_TYPE_NONE);
+            TASK_RESPONSE_TYPE_NONE,
+            usage);
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
+        // counted before the body is read, so a request that fails to parse still counts
+        auto usage = begin_usage();
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
@@ -4323,11 +4402,14 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body,
             files,
-            TASK_RESPONSE_TYPE_OAI_CMPL);
+            TASK_RESPONSE_TYPE_OAI_CMPL,
+            usage);
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
+        // counted before the body is read, so a request that fails to parse still counts
+        auto usage = begin_usage();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
         json body_parsed = oaicompat_chat_params_parse(
@@ -4339,11 +4421,14 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            TASK_RESPONSE_TYPE_OAI_CHAT,
+            usage);
     };
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
+        // counted before the body is read, so a request that fails to parse still counts
+        auto usage = begin_usage();
         std::vector<raw_buffer> files;
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
@@ -4357,7 +4442,8 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_RESP);
+            TASK_RESPONSE_TYPE_OAI_RESP,
+            usage);
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -4390,6 +4476,8 @@ void server_routes::init_routes() {
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
+        // counted before the body is read, so a request that fails to parse still counts
+        auto usage = begin_usage();
         std::vector<raw_buffer> files;
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
@@ -4403,7 +4491,8 @@ void server_routes::init_routes() {
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_ANTHROPIC);
+            TASK_RESPONSE_TYPE_ANTHROPIC,
+            usage);
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {

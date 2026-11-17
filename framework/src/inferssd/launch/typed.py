@@ -24,6 +24,7 @@ from inferssd.launch import ram
 from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
+from inferssd.machine.identity import TIER_BACKENDS
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
 
@@ -61,8 +62,8 @@ class LaunchSpec:
     overrides: tuple[tuple[str, str], ...] = ()
     binary: Optional[str] = None
     artifact_directory: Optional[str] = None
-    # Unset sizes take CONTEXT and BATCH, or one pass per prompt where the
-    # strategy prefills that way: -b and -ub as large as the context.
+    # Unset sizes take CONTEXT and BATCH; with the strategy, one pass per
+    # prompt: -b and -ub as large as the context.
     context: Optional[int] = None
     batch: Optional[int] = None
     ubatch: Optional[int] = None
@@ -96,7 +97,15 @@ def connect_host(host: str) -> str:
     return LOOPBACK if host == "0.0.0.0" else host
 
 
-CONTEXT = 8192
+# A context left unset: with SSD experts, 0, which the engine resolves to the largest multiple of
+# 8192 up to the model's trained context whose KV cache fits memory when full (it holds memory
+# only for the cells in use). A RAM-only model takes the largest multiple of CONTEXT_STEP up to
+# CONTEXT that fits memory.
+AUTO_CONTEXT = 0
+CONTEXT = 65536
+CONTEXT_STEP = 8192
+# One pass a prompt with the context unset: a batch the engine bounds by the context it chose.
+ONE_PASS_BATCH = 1 << 20
 BATCH = 512
 # The disk prompt cache's size limit per model.
 PROMPT_CACHE_MIB = 16384
@@ -443,18 +452,44 @@ def _resolve(
         )
     planned: Optional[Planned] = None
     ram_fit: Optional[dict[str, object]] = None
+    # How the engine holds an ordinary model's weights (ram.admission). On Apple silicon the
+    # per-layer embedding table stays in the file unlocked, read by rows as tokens use it, and the
+    # GPU's tensors sit in a Metal buffer the GPU keeps resident; elsewhere the CPU maps and
+    # locks the whole file and other GPU backends read it into their own buffers.
+    weights = (
+        ram.LOOKUPS_IN_FILE if platform == "darwin" else ram.COPIED if gpu_backends else ram.FILE
+    )
     if ordinary:
         runtime = runtime_facts_from(s.value("runtime_facts"))
         configured_budget = cast(int, value.at("host.budget_mib").value) << 20
-        ram_fit = ram.admission(
-            observed if observed is not None else s.value("model_facts", *paths),
-            context=spec.context or CONTEXT,
-            batch=spec.ubatch or BATCH,
-            gpu=bool(gpu_backends),
-            available=runtime.available_bytes,
-            budget=min(memory, configured_budget) if configured_budget else memory,
-            headroom=max(reserve, cast(int, value.at("host.headroom_mib").value) << 20),
+        facts = observed if observed is not None else s.value("model_facts", *paths)
+        available = runtime.available_bytes
+        # A context left unset takes the largest step down from CONTEXT that fits the memory
+        # available now, else the smallest step; one given is kept. Either must be admitted.
+        contexts = (
+            [spec.context]
+            if spec.context
+            else list(range(CONTEXT, CONTEXT_STEP - 1, -CONTEXT_STEP))
         )
+        for index, ram_context in enumerate(contexts):
+            last = index == len(contexts) - 1
+            try:
+                ram_fit = ram.admission(
+                    facts,
+                    context=ram_context,
+                    batch=spec.ubatch or BATCH,
+                    weights=weights,
+                    budget=min(memory, configured_budget) if configured_budget else memory,
+                    available=available,
+                    reserve=reserve,
+                )
+            except ValueError:
+                if last:
+                    raise
+                continue
+            if last or available is None or cast(int, ram_fit["required_bytes"]) <= available:
+                break
+        spec = replace(spec, context=ram_context)
         if (
             not gpu_backends
             and not threads.cpus
@@ -552,19 +587,25 @@ def _resolve(
                     "the memory controller is not delegated to your systemd user manager: "
                     "add Delegate=memory to a user@.service drop-in, or launch as root" + guide
                 )
-    # The CUDA tier finds its GPUs through nvidia-smi. With the engine's backends unknown, the
-    # engine itself refuses a budget it has no tier for.
-    if not ordinary and value.at("vram.budget").value != 0 and "CUDA" in (gpu_backends or ()):
+    # The launch reads the VRAM tier's GPUs through their driver: nvidia-smi for CUDA, amdkfd for
+    # ROCm. With the engine's backends unknown, the engine itself refuses a budget it has no tier
+    # for.
+    tier = set(TIER_BACKENDS) & set(gpu_backends or ())
+    if not ordinary and value.at("vram.budget").value != 0 and tier:
         if not s.value("gpu_available"):
-            raise ValueError("typed GPU execution requires nvidia-smi")
-    # A setting of a GPU backend's expert tier needs an engine built with that backend.
+            raise ValueError(
+                "typed GPU execution requires the GPUs' driver: "
+                "nvidia-smi for CUDA, amdkfd for ROCm"
+            )
+    # A setting of the expert tier needs an engine built with a backend that carries it.
     for item in () if ordinary else value.entries:
         backend = schema()["properties"][item.key].get("backend")
         if backend and item.origin != "default" and gpu_backends is not None:
-            if backend not in gpu_backends:
+            if not set(backend.split(",")) & set(gpu_backends):
                 raise ValueError(
-                    f"{item.key} ({item.location}) configures the {backend} expert tier, "
-                    "which this engine was built without"
+                    f"{item.key} ({item.location}) configures the expert tier of "
+                    + " or ".join(backend.split(","))
+                    + ", which this engine was built without"
                 )
     # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
     if not ordinary and set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(
@@ -581,9 +622,9 @@ def _resolve(
     if planned is not None:
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
-    context = spec.context or CONTEXT
+    context = spec.context or (CONTEXT if ordinary else AUTO_CONTEXT)
     one_pass = planned is not None and planned.one_pass
-    batch = spec.batch or (context if one_pass else BATCH)
+    batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
     ubatch = spec.ubatch or (batch if one_pass else BATCH)
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
@@ -598,7 +639,7 @@ def _resolve(
                 literal(item, platform),
             ]
     command += [
-        "--no-mmap" if ordinary and gpu_backends else "--mmap",
+        "--no-mmap" if ordinary and weights == ram.COPIED else "--mmap",
         "--no-repack",
         "--fit",
         "off",
@@ -613,8 +654,8 @@ def _resolve(
         str(ubatch),
     ]
     if ordinary:
+        command += ["--mlock"] if weights != ram.LOOKUPS_IN_FILE else []
         command += [
-            "--mlock",
             "--cache-type-k",
             "f16",
             "--cache-type-v",

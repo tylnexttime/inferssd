@@ -17,23 +17,23 @@
 #include <vector>
 
 // A sink under test and the compute participants a ggml graph gives its calls: the test thread coordinates and
-// participants - 1 joiner threads enter through kimi_cpu_sink_call_join, as ggml's other threads do. One call stays
+// participants - 1 joiner threads enter through ssd_cpu_sink_call_join, as ggml's other threads do. One call stays
 // open from creation to release, so every run in between computes on all participants.
 class sink_ptr {
 public:
     sink_ptr() = default;
-    explicit sink_ptr(kimi_cpu_sink * sink, int participants = 1) : sink_(sink) {
+    explicit sink_ptr(ssd_cpu_sink * sink, int participants = 1) : sink_(sink) {
         if (!sink_ || participants <= 1) { return; }
         char error[256] = {};
-        if (!kimi_cpu_sink_call_open(sink_, participants, error, sizeof(error))) {
-            kimi_cpu_sink_destroy(sink_);
+        if (!ssd_cpu_sink_call_open(sink_, participants, error, sizeof(error))) {
+            ssd_cpu_sink_destroy(sink_);
             throw std::runtime_error(std::string("sink call open: ") + error);
         }
         // A joiner that cannot start leaves the call waiting for it forever.
         try {
             joiners_.reserve(size_t(participants - 1));
             for (int ith = 1; ith < participants; ++ith) {
-                joiners_.emplace_back([sink, ith, participants] { kimi_cpu_sink_call_join(sink, ith, participants); });
+                joiners_.emplace_back([sink, ith, participants] { ssd_cpu_sink_call_join(sink, ith, participants); });
             }
         } catch (...) { std::fprintf(stderr, "sink joiner thread failed to start\n"); std::abort(); }
     }
@@ -52,18 +52,18 @@ public:
     void reset() {
         if (!sink_) { return; }
         if (!joiners_.empty()) {
-            kimi_cpu_sink_call_close(sink_);
+            ssd_cpu_sink_call_close(sink_);
             for (auto & joiner : joiners_) { joiner.join(); }
             joiners_.clear();
         }
-        kimi_cpu_sink_destroy(sink_);
+        ssd_cpu_sink_destroy(sink_);
         sink_ = nullptr;
     }
-    kimi_cpu_sink * get() const { return sink_; }
+    ssd_cpu_sink * get() const { return sink_; }
     explicit operator bool() const { return sink_ != nullptr; }
 
 private:
-    kimi_cpu_sink * sink_ = nullptr;
+    ssd_cpu_sink * sink_ = nullptr;
     std::vector<std::thread> joiners_;
 };
 
@@ -94,10 +94,11 @@ struct fixture_inputs {
             "ready_first", "early_up_gate", "role_major", "nonblocking_down_sched",
             "dynamic_rows", "read_fixed", "poll_us", "dynamic_chunk_rows", "row_weights",
             "io_cpus", "decode_participants", "prefetch_depth", "prefetch_fail_every", "prefetch_throw_drain",
-            "prefetch_throw_schedule", "cache_policy", "cache_allocation", "cache_keep", "cache_prefill_read",
+            "prefetch_throw_schedule", "prefill_lookahead", "lookahead_fail_every",
+            "cache_policy", "cache_allocation", "cache_keep", "cache_prefill_read",
             "cache_elastic", "cache_partial_reclaim", "cache_reclaimable_file", "cache_reserve_bytes",
-            "cache_prefill_slots", "cache_layer_quotas", "vram_budget", "vram_async", "vram_exclusive",
-            "vram_deferred", "vram_prefill", "vram_locations", "place_costs", "trace", "timeline", "profile",
+            "cache_prefill_slots", "cache_layer_quotas", "vram_budget", "vram_async",
+            "vram_deferred", "vram_prefill", "place_costs", "trace", "timeline", "profile",
             "mrc", "ledger"
         };
         if (std::none_of(std::begin(recognized), std::end(recognized), [&](const char * item) { return key == item; })) {
@@ -189,12 +190,12 @@ struct fixture_inputs {
         FIXTURE_BOOL(nonblocking_down_sched); FIXTURE_BOOL(dynamic_rows); FIXTURE_BOOL(read_fixed);
         FIXTURE_BOOL(cache_keep); FIXTURE_BOOL(cache_prefill_read); FIXTURE_BOOL(cache_elastic);
         FIXTURE_BOOL(cache_partial_reclaim); FIXTURE_BOOL(cache_reclaimable_file);
-        FIXTURE_BOOL(vram_async); FIXTURE_BOOL(vram_exclusive); FIXTURE_BOOL(vram_deferred);
-        FIXTURE_BOOL(vram_prefill); FIXTURE_BOOL(vram_locations);
+        FIXTURE_BOOL(vram_async); FIXTURE_BOOL(vram_deferred);
+        FIXTURE_BOOL(vram_prefill); FIXTURE_BOOL(prefill_lookahead);
         FIXTURE_INT(poll_us); FIXTURE_INT(dynamic_chunk_rows); FIXTURE_INT(decode_participants);
         FIXTURE_INT(prefetch_depth); FIXTURE_INT(prefetch_fail_every); FIXTURE_INT(prefetch_throw_drain);
         FIXTURE_INT(prefetch_throw_schedule); FIXTURE_INT(cache_reserve_bytes); FIXTURE_INT(cache_prefill_slots);
-        FIXTURE_INT(vram_budget);
+        FIXTURE_INT(vram_budget); FIXTURE_INT(lookahead_fail_every);
 #undef FIXTURE_BOOL
 #undef FIXTURE_INT
         if (const char * value = get("cache_policy")) { out.cache_policy = value; }
@@ -257,9 +258,9 @@ struct fixture_inputs {
         return out;
     }
     // threads counts the I/O thread, as the fixtures' CTest names do: threads - 1 compute participants.
-    sink_ptr create(int threads, int depth, kimi_cpu_sink_resolver resolver, void * userdata,
+    sink_ptr create(int threads, int depth, ssd_cpu_sink_resolver resolver, void * userdata,
             char * error, size_t size) const {
-        kimi_cpu_sink * sink = nullptr;
+        ssd_cpu_sink * sink = nullptr;
         try {
             const auto selection = debug();
             auto services = runtime;

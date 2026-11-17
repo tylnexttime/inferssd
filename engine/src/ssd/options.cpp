@@ -159,7 +159,7 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     const auto * reserve_mib = settings.integer("vram.reserve_mib");
     constexpr size_t mib = size_t{1} << 20;
     if (!reserve_mib || *reserve_mib > std::numeric_limits<size_t>::max() / mib) {
-        throw std::runtime_error("CUDA allocation reserve is not representable in bytes");
+        throw std::runtime_error("GPU allocation reserve is not representable in bytes");
     }
     services.gpu_reserve_bytes = static_cast<size_t>(*reserve_mib) * mib;
 }
@@ -174,17 +174,15 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     if (!get) { return; }
     if (services.gpu) { throw std::runtime_error("one GPU expert executor per context is supported"); }
     const auto * provider = get();
-    if (!provider || provider->version != 1 || provider->size != sizeof(*provider) ||
+    if (!provider || provider->version != 2 || provider->size != sizeof(*provider) ||
             !provider->device_is_unified || !provider->device_ordinal || !provider->attach_services || !provider->stream) {
         throw std::runtime_error("GPU backend has no compatible SSD provider table");
     }
     const auto * transport = provider->transport;
     if (transport && (transport->version != 1 || transport->size != sizeof(*transport) ||
             transport->runtime_services_size != sizeof(services) || !transport->create ||
-            !transport->quiesce || !transport->destroy || !transport->copy_ranges ||
-            !transport->dense_has || !transport->dense_prepare || !transport->dense_read_ahead ||
-            !transport->dense_copy || !transport->seed_register || !transport->seed_unregister ||
-            !transport->seed_offer || !transport->seed_fence)) {
+            !transport->quiesce || !transport->destroy || !transport->dense_has || !transport->dense_prepare ||
+            !transport->dense_read_ahead || !transport->dense_copy)) {
         throw std::runtime_error("GPU backend has no compatible context transport table");
     }
     const int device = provider->device_ordinal(backend);

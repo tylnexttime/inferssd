@@ -29,9 +29,12 @@ These are the tested GGUF files, community conversions of the named model releas
 | Gemma4 E4B | 7.46B total / E4B | [Google · QAT Q4_0](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf) |
 
 Gemma uses the ordinary native loader without SSD expert offload. Before loading, the shared
-launcher checks that weights, KV cache and working memory fit the live available RAM, the
-configured budget and headroom. An insufficient fit is rejected. macOS and Windows use the
-same model selection and launch entry points.
+launcher checks that weights, KV cache and working memory fit the memory budget, the machine's
+physical memory unless a smaller one is configured; the system pages other memory out to make
+room. On Apple silicon the per-layer embedding table, 2.15 GiB of the 4.80 GiB file, stays in the
+file and its rows are read from the SSD as tokens use them; the other weights are held in memory.
+A model that does not fit is rejected. macOS and Windows use the same model selection and launch
+entry points.
 
 ## Performance benchmarks
 
@@ -82,19 +85,19 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 
 ## Get started
 
-Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
+Install on Apple Silicon macOS, or on Linux with an NVIDIA GPU or an AMD GPU with ROCm:
 
 ```sh
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
-Each numbered release includes checked prebuilt packages for Apple Silicon macOS 15 or later and Windows 11 x64, built from the same tagged commit. Its installers download that exact release without developer tools; see [the macOS package](docs/macos-package.md) and [Windows package](docs/windows-package.md). Linux builds that release from source for the machine's CPU and GPU, which takes about 2 to 12 minutes. The installer on `main` downloads the latest published package:
+Each numbered release includes checked prebuilt packages for Apple Silicon macOS 15 or later and Windows 10 or 11 x64, built from the same tagged commit. Its installers download that exact release without developer tools; see [the macOS package](docs/macos-package.md) and [Windows package](docs/windows-package.md). Linux builds that release from source for the machine's CPU and GPU, which takes about 2 to 12 minutes. The installer on `main` downloads the latest published package:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
 ```
 
-The installer works in a private environment and uses no `sudo`. A source build needs Git, Python 3.9 or later, and a C/C++ compiler. On macOS it also needs the Xcode Command Line Tools; Linux also needs systemd with cgroup v2, and the CUDA toolkit on a machine with an NVIDIA GPU. Follow the printed PATH instruction if it shows one.
+The installer works in a private environment and uses no `sudo`. A source build needs Git, Python 3.9 or later, and a C/C++ compiler. On macOS it also needs the Xcode Command Line Tools; Linux also needs systemd with cgroup v2, and the CUDA toolkit on a machine with an NVIDIA GPU or the ROCm HIP SDK on a machine whose AMD GPU runs on ROCm. Follow the printed PATH instruction if it shows one.
 
 Then start a model:
 
@@ -127,8 +130,13 @@ field:
 $ inferssd --version
 inferssd 0.1.3 (261106.202.03af979)
 $ inferssd --version --json
-{"version": "0.1.3", "build": 202, "revision": "03af97…", "date": "2026-11-06", "branch": "main", "label": "261106.202.03af979"}
+{"version": "0.1.3", "build": 202, "revision": "03af97…", "date": "2026-11-06", "branch": "main", "label": "261106.202.03af979", "capabilities": {"model_profiles": […], "gpu_backends": ["Metal"]}}
 ```
+
+`capabilities` lists the model profiles the engine launches and, when the installer recorded them,
+the GPU backends it was built with (an empty list for a CPU-only build). The Windows packages are
+one per backend, so this is how something running the engine knows which one is installed, and
+so which package list names its updates.
 
 The engine only says what it is. Whether a build is one it can work with is for whatever runs
 the engine to decide; the WiCi AI desktop app, for one, installs `main`, offers its newer

@@ -20,8 +20,8 @@ term is zero. With two distinct observed token counts, a nonnegative
 least-squares fit estimates both terms. An empty sample window retains the
 previous estimate.
 
-The byte geometry comes from `kimi_vram_prefill_lane` in
-`engine/ggml/src/ggml-ssd/gpu/kimi-vram-tier-api.h`. The grouped engine reports
+The byte geometry comes from `ssd_vram_prefill_lane` in
+`engine/ggml/src/ggml-ssd/gpu/vram-tier-api.h`. The grouped engine reports
 both input and output row bytes; a lane that reports `token_bytes=0` (as the
 retired MXFP4 hand engine did, charging its input per route) has a row prior of
 its output bytes alone. The existing observed copy rate, or existing configured link prior
@@ -45,7 +45,7 @@ begin interval also includes a small route-list copy already represented by
 the route cost; that existing approximation is unchanged here. Sample age,
 exploration and transport-direction calibration remain separate work.
 
-`engine/tests/ssd/test-kimi-prefill-cost.cpp` covers the recorded small-to-large
+`engine/tests/ssd/test-ssd-prefill-cost.cpp` covers the recorded small-to-large
 query, repeated same-shape observations, a synthetic second shape, nonnegative
 fit boundaries, charging fixed overhead once, and unchanged vector-pass pricing.
 The existing placement regression cases run in the same standalone CPU test.

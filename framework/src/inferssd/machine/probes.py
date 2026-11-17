@@ -46,12 +46,22 @@ from inferssd.platform.captured_command import run_captured
 
 EXECUTABLES = PROBES
 TIMEOUT_S = {"ssd": 1800.0, "cpu": 1800.0, "memory": 900.0}
-# The profile describes the whole machine, so a probe sees every device.
-HIDDEN = {"memory": ("CUDA_VISIBLE_DEVICES",)}
+# The profile describes the whole machine, so a probe sees every device: CUDA's and ROCm's
+# visible-device lists are hidden from it.
+HIDDEN = {"memory": ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}
 
 
 class ProbeError(RuntimeError):
-    """A probe is missing, failed, timed out or printed output outside its schema."""
+    """A probe is missing, failed, timed out or printed output outside its schema.
+
+    `status` is the probe's exit status and `reason` its last stderr line, for a caller
+    that answers one failure differently; both are empty when the probe did not run.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None, reason: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -234,7 +244,9 @@ class Probes:
             lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
             raise ProbeError(
                 f"{EXECUTABLES[name]} exited with status {result.returncode}: "
-                + (lines[-1] if lines else "no reason given")
+                + (lines[-1] if lines else "no reason given"),
+                status=result.returncode,
+                reason=lines[-1] if lines else "",
             )
         return parse(name, result.stdout)
 
@@ -331,7 +343,7 @@ def skipped(report: Any) -> list[str]:
 
 
 def skipped_devices(report: Any) -> dict[int, str]:
-    """Memory probe devices it could not measure, by CUDA index, with the reason."""
+    """Memory probe devices it could not measure, by the runtime's device index, with the reason."""
     return {row["index"]: row["reason"] for row in report.get("skipped", [])}
 
 

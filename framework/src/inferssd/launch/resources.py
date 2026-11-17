@@ -16,15 +16,21 @@ from inferssd.configuration.settings import PLATFORMS, host_platform
 # A checkout's build directories, searched in this order: the presets first,
 # then the conventional ad hoc ones.
 BUILDS = {
-    "linux": ("build-linux-cuda", "build-linux-cpu", "build"),
+    "linux": ("build-linux-cuda", "build-linux-rocm", "build-linux-cpu", "build"),
     "darwin": ("build-macos-metal", "build-mac", "build"),
     "windows": ("build-windows-llvm", "build-x64-windows-llvm-release", "build"),
 }
 # The machine probes by the name a resource descriptor's probes map gives them.
 PROBES = {"ssd": "inferssd-ssdprobe", "cpu": "inferssd-cpuprobe", "memory": "inferssd-memprobe"}
 # The GPU backends an engine can be built with, by the name the machine identity
-# gives a GPU's backend, and the CMake option that builds each.
-GPU_BACKENDS = {"CUDA": "GGML_CUDA", "Metal": "GGML_METAL", "Vulkan": "GGML_VULKAN"}
+# gives a GPU's backend, and the CMake option that builds each: ROCm is ggml's HIP
+# backend, which names its devices ROCm0, ROCm1 and so on.
+GPU_BACKENDS = {
+    "CUDA": "GGML_CUDA",
+    "ROCm": "GGML_HIP",
+    "Metal": "GGML_METAL",
+    "Vulkan": "GGML_VULKAN",
+}
 
 
 def cmake_gpu_backends(cache: str) -> tuple[str, ...]:
@@ -54,6 +60,25 @@ def data_directory(
         local = environ.get("LOCALAPPDATA")
         return (Path(local) if local else home / "AppData" / "Local") / "inferssd"
     return home / ".local/share/inferssd"
+
+
+def cache_directory(
+    environ: Mapping[str, str] = os.environ,
+    home: Optional[Path] = None,
+    platform: Optional[str] = None,
+) -> Path:
+    """Where this user's inferssd caches live: the prompt caches and the expert indexes."""
+    home = home or Path.home()
+    name = platform or host_platform()
+    if name == "darwin":
+        root = home / "Library" / "Caches"
+    elif name == "windows":
+        local = environ.get("LOCALAPPDATA")
+        root = Path(local) if local else home / "AppData" / "Local"
+    else:
+        cache = environ.get("XDG_CACHE_HOME")
+        root = Path(cache) if cache else home / ".cache"
+    return root / "inferssd"
 
 
 def installed_resources(

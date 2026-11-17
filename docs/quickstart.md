@@ -5,12 +5,12 @@
 
 Every platform uses `wici-ai/inferssd`. Numbered releases share one version and tagged commit across platforms. Use the
 [one-command installation](#one-command-installation), or build manually for
-**[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** /
+**[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** / **[Linux / AMD](#linux--amd)** /
 **[Windows](#windows)** and [prepare a launch](#prepare-a-launch).
 
 ## Before you start
 
-- For a manual source build, install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs the Xcode Command Line Tools; Linux needs a compatible CUDA toolkit on a machine with an NVIDIA GPU. Prebuilt macOS and Windows packages need none of these tools.
+- For a manual source build, install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs the Xcode Command Line Tools; Linux needs a compatible CUDA toolkit on a machine with an NVIDIA GPU, or the ROCm HIP SDK on a machine whose AMD GPU runs on ROCm. Prebuilt macOS and Windows packages need none of these tools.
 - Choose a [tested GGUF checkpoint](../README.md#models). `cli -hf` and `serve -hf` download all shards of its tested quantization. For manual `launch`, obtain a complete local copy and keep all shards together.
 - Plan storage for the checkpoint. The benchmarked DeepSeek GGUF files take about **473 GiB**; an optional DeepSeek expert pack adds about **269 GiB**, and a Muse pack about **450 GiB**. The framework can index GGUF experts directly, so a pack is optional and must match its source checkpoint.
 - Choose CPU, cache and process-memory budgets for your machine. The README benchmark settings describe their recorded runs, not universal deployment defaults.
@@ -29,7 +29,7 @@ irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | i
 
 A numbered release includes prebuilt [macOS](macos-package.md) and [Windows](windows-package.md)
 packages from the same tagged commit. Its installers download that version without developer
-tools on Apple Silicon macOS 15 or later and Windows 11 x64. Linux still builds from source.
+tools on Apple Silicon macOS 15 or later and Windows 10 or 11 x64. Linux still builds from source.
 The installer on `main` installs the latest published package:
 
 ```sh
@@ -51,9 +51,10 @@ A source build checks for a C/C++
 compiler, Git, Python 3.9+ with `venv`, and the platform toolchain. On macOS,
 the Xcode Command Line Tools must be installed. The engine is built for the machine's GPUs, as the
 [machine profile](machine-profile.md) lists them: for an NVIDIA GPU with CUDA, which
-needs `nvcc` on PATH, under `/usr/local/cuda`, or through `CUDACXX`; for an AMD or
-Intel GPU with Vulkan, when the Vulkan SDK's `glslc` is on PATH; and for the CPU
-alone otherwise.
+needs `nvcc` on PATH, under `/usr/local/cuda`, or through `CUDACXX`; for an AMD GPU on
+ROCm (ROCm installed, so its `rocminfo` is on PATH) with ROCm, which needs the HIP SDK's
+`hipconfig` on PATH or its `clang++` through `HIPCXX`; for another AMD or an Intel GPU
+with Vulkan, when the Vulkan SDK's `glslc` is on PATH; and for the CPU alone otherwise.
 The [Linux runtime requirements](#linux-requirements) still apply. On Windows,
 see the [Windows requirements](#windows); there the installation root is
 `%LOCALAPPDATA%\inferssd` and the command is `inferssd.cmd` in its `bin` directory.
@@ -159,7 +160,7 @@ Use the same Metal build and point `-m` at the first Muse GGUF shard; the launch
 
 ## Windows
 
-The prebuilt packages require Windows x64 build 22000 or later and GPU drivers for GPU
+The prebuilt packages run on Windows 10 and later x64 and use GPU drivers for GPU
 inference: an NVIDIA GPU runs the CUDA package, any other GPU the Vulkan package; CPU inference
 is also available. It runs the same `inferssd profile`, `inferssd cli` and
 `inferssd serve` as the other platforms. The desktop app uses the real executable at
@@ -196,8 +197,32 @@ python3 scripts/engine-resources.py \
   --build build-linux-cuda --output engine-resources.json
 ```
 
-Without an NVIDIA GPU, build `--preset linux-cpu` and leave out `inferssd-memprobe`; add
-`-DGGML_VULKAN=ON` with the Vulkan SDK to run an AMD or Intel GPU through Vulkan.
+For an AMD GPU on ROCm, see [Linux / AMD](#linux--amd). Without either, build
+`--preset linux-cpu` and leave out `inferssd-memprobe`; add `-DGGML_VULKAN=ON` with the
+Vulkan SDK to run an AMD or Intel GPU through Vulkan.
+
+## Linux / AMD
+
+An AMD GPU that ROCm supports runs the same engine as an NVIDIA GPU: ggml's HIP backend
+builds the CUDA backend's sources, the expert VRAM tier included, for AMD's GPUs. Install
+ROCm with its HIP SDK (for example with `amdgpu-install --usecase=rocm`); the kernel's
+`amdgpu` driver must support the GPU. The preset builds for the GPUs of the machine it
+runs on; set `GPU_TARGETS` (for example `gfx1201`) to build for others. It keeps ggml's
+default of no HIP virtual memory management (`GGML_HIP_NO_VMM`): on ROCm 7.2.4 with the
+kernel's own `amdgpu` driver, an RDNA4 GPU faults on memory mapped through it, although it
+reports support. Without it the backend's memory pool reserves a graph's memory as one
+allocation before the graph runs, as the CUDA backend's pool maps it.
+
+```sh
+HIPCXX="$(hipconfig -l)/clang++" cmake --preset linux-rocm
+cmake --build build-linux-rocm --parallel 4 \
+  --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe inferssd-memprobe
+python3 scripts/engine-resources.py \
+  --build build-linux-rocm --output engine-resources.json
+```
+
+Without ROCm, an AMD GPU runs the dense layers through Vulkan and the CPU computes every
+routed expert.
 The [Linux resource prerequisites](testing.md#linux-resource-prerequisites) describe I/O, cgroup and pinned-memory requirements.
 
 ### Linux requirements
@@ -226,7 +251,7 @@ inferssd serve \
   -m /path/to/model-00001-of-00010.gguf
 ```
 
-For Muse, Qwen3.8-Flash-Next or Qwen3.6-35B-A3B, select that model's first GGUF shard instead. The launch picks the model profile from the GGUF's `general.architecture`: `dsv` for DeepSeek-V4.1 (with its own sampling defaults, temperature 1.0, top-p 0.95), `muse` for Muse Spark, `qwen4exp` for Qwen3.8-Flash-Next and `qwen35moe` for Qwen3.6-35B-A3B; the two Qwen profiles keep the chat template embedded in their GGUF. The context defaults to 8192 tokens (`--context` sets it) and the batch sizes to what the launch chooses for this machine. The server listens on `127.0.0.1:8080`; `--port` chooses another port, and `--host` another IPv4 address to listen on, `0.0.0.0` for every network interface. Each launch keeps its logs and receipts under `~/.local/share/inferssd/state/runs`, and uses the whole machine: the engine keeps its own margin for the host.
+For Muse, Qwen3.8-Flash-Next or Qwen3.6-35B-A3B, select that model's first GGUF shard instead. The launch picks the model profile from the GGUF's `general.architecture`: `dsv` for DeepSeek-V4.1 (with its own sampling defaults, temperature 1.0, top-p 0.95), `muse` for Muse Spark, `qwen4exp` for Qwen3.8-Flash-Next and `qwen35moe` for Qwen3.6-35B-A3B; the two Qwen profiles keep the chat template embedded in their GGUF. The context defaults to the largest multiple of 8192, up to the model's trained context, whose KV cache fits memory when full: the KV cache takes memory 8192 tokens at a time as a conversation grows and gives it back when a shorter one starts, so a long context costs nothing until a conversation fills it, and the expert caches give it room as it grows. Where the GPU's buffers cannot grow in place (CUDA without VMM, Vulkan without sparse residency buffers), the KV cache holds every token from the start and the context defaults to at most 32768. A RAM-only model takes the largest multiple of 8192 up to 65536 that fits the memory available now, or 8192 when none does. `--context` sets it. The batch sizes default to what the launch chooses for this machine. The server listens on `127.0.0.1:8080`; `--port` chooses another port, and `--host` another IPv4 address to listen on, `0.0.0.0` for every network interface. Each launch keeps its logs and receipts under `~/.local/share/inferssd/state/runs`, and uses the whole machine: the engine keeps its own margin for the host.
 
 If `expert.source` is omitted, the framework builds an alias index from the GGUF metadata without duplicating weight payloads. Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
 

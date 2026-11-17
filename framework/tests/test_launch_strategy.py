@@ -94,14 +94,14 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
     # unpinned threads, one left for the I/O thread.
     assert argv[argv.index("-t") : argv.index("-t") + 4] == ["-t", "61", "-tb", "60"]
     assert "-C" not in argv and argv[-2:] == ["--ctx-checkpoints", "1"]
-    # With the CUDA GPU a prompt is prefilled in one pass as large as the context.
+    # A prompt is prefilled in one pass as large as the context.
     assert argv[argv.index("-c") : argv.index("-c") + 6] == [
         "-c",
-        "8192",
+        "0",
         "-b",
-        "8192",
+        "1048576",
         "-ub",
-        "8192",
+        "1048576",
     ]
     settings = native(out, spec)
     for key in ("cpu.io_cpus", "cpu.decode_participants", "place.costs"):
@@ -127,18 +127,16 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
         "cpu.io_cpus",
         "place.costs",
     ]
-    # The toy model's experts are so small that the CPU prefills any pass no slower.
-    assert settings.at("prefill.cpu_max_tokens").origin == "default"
-    assert any(
-        note.startswith("prefill: the CPU route for every pass") for note in receipt["notes"]
-    )
+    # Every pass takes the engine's SSD sink.
+    assert any(note.startswith("prefill: the SSD sink for every pass") for note in receipt["notes"])
     assert receipt["chosen"]["threads"] == {"decode": 61, "batch": 60}
     assert receipt["chosen"]["server_args"] == ["--ctx-checkpoints", "1"]
-    assert receipt["chosen"]["one_pass"] is True
+    assert any(note.startswith("prefill: one pass a prompt") for note in receipt["notes"])
+    # The context is the engine's: the largest that fits memory (0); one pass, as large as it.
     assert (line["launch"]["context"], line["launch"]["batch"], line["launch"]["ubatch"]) == (
-        8192,
-        8192,
-        8192,
+        0,
+        1048576,
+        1048576,
     )
     assert (receipt["kept"], receipt["dropped"]) == ([], [])
     assert any(note.startswith("threads: all placement") for note in receipt["notes"])
@@ -204,7 +202,7 @@ def test_without_a_usable_gpu_the_budget_is_zero_and_no_gpu_is_checked(tmp_path)
 def test_user_launch_checks_still_apply_to_the_merged_result(tmp_path):
     inputs, spec, host, adapter, out = strategic(tmp_path)
     host["gpu_available"] = False
-    with pytest.raises(ValueError, match="requires nvidia-smi"):
+    with pytest.raises(ValueError, match="requires the GPUs' driver"):
         resolved(inputs, spec, adapter, out)
 
 
@@ -326,7 +324,8 @@ def test_recorded_engine_gpu_backends():
     # Recordings made before the fact existed: the engine's backends are unknown.
     assert recorded({})(fact).value is None
     assert recorded({"engine_gpu_backends": ["Metal"]})(fact).value == ["Metal"]
-    for value in (["ROCm"], "CUDA", ["CUDA", "CUDA"]):
+    assert recorded({"engine_gpu_backends": ["ROCm"]})(fact).value == ["ROCm"]
+    for value in (["OpenCL"], "CUDA", ["CUDA", "CUDA"]):
         with pytest.raises(ValueError, match="engine_gpu_backends"):
             recorded({"engine_gpu_backends": value})(fact)
 
@@ -359,7 +358,9 @@ def test_recorded_model_runtime_and_drive_facts(tmp_path):
     with pytest.raises(ValueError, match="model_facts.roles is required"):
         recorded({"model_facts": partial_header})(Fact("model_facts", (model,)))
     runtime_value = recorded({"runtime_facts": runtime_record()})(Fact("runtime_facts")).value
-    assert runtime_value == dict(runtime_record(), memory_budget_bytes=None)
+    # A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
+    gpus = [dict(row, backend="CUDA") for row in runtime_record()["gpus"]]
+    assert runtime_value == dict(runtime_record(), gpus=gpus, memory_budget_bytes=None)
     with pytest.raises(ValueError, match="Missing recorded host fact: runtime_facts"):
         recorded({})(Fact("runtime_facts"))
     with pytest.raises(ValueError, match="must not repeat a CPU"):
@@ -400,7 +401,9 @@ def test_live_strategy_facts(tmp_path):
     assert adapter(Fact("machine_characteristics")).value == "CHARACTERISTICS"
     assert adapter(Fact("runtime_facts")).value == {
         "cpus": [0, 1],
-        "gpus": [{"uuid": "GPU-aaaa", "free_bytes": 30000 << 20, "processes": 0}],
+        "gpus": [
+            {"uuid": "GPU-aaaa", "free_bytes": 30000 << 20, "processes": 0, "backend": "CUDA"}
+        ],
         "available_bytes": 1000 * 1024,
         "memory_budget_bytes": None,
     }

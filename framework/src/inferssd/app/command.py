@@ -9,11 +9,10 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import cast
 
 from inferssd.app.hub import download, selection
 from inferssd.configuration.settings import host_platform
-from inferssd.launch import ram, typed_command
+from inferssd.launch import typed_command
 from inferssd.launch.resources import data_directory, installed_resources, read_resources
 from inferssd.launch.typed import LOOPBACK, connect_host, listen_host
 from inferssd.platform.captured_command import run_captured
@@ -47,7 +46,12 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
                 "0.0.0.0 also accepts other devices on your network",
             )
         parser.add_argument("--port", type=int, default=8080)
-        parser.add_argument("--context", type=int, default=8192)
+        parser.add_argument(
+            "--context",
+            type=int,
+            help="context in tokens (default: the largest multiple of 8192, up to the model's "
+            "trained context, that memory holds when full)",
+        )
         parser.add_argument(
             "--settings", type=Path, help="typed settings file (see docs/configuration.md)"
         )
@@ -95,7 +99,7 @@ def run(args: argparse.Namespace) -> int:
     from inferssd.app.chat import chat
     from inferssd.engine.command import run_native
 
-    if not 1 <= args.port <= 65535 or args.context < 1:
+    if not 1 <= args.port <= 65535 or (args.context is not None and args.context < 1):
         raise ValueError("port must be 1..65535; context must be positive")
     # Terminal chat talks to its own server, so only serve listens beyond this machine.
     host = listen_host(args.host) if args.command == "serve" else LOOPBACK
@@ -126,11 +130,6 @@ def run(args: argparse.Namespace) -> int:
     else:
         model = args.model.expanduser().resolve(strict=True)
     policy = default_policy(state)
-    if ram.is_model(str(model)):
-        # Keep the RAM-only admission margin enforced while other applications run.
-        policy["host_reserve_bytes"] = max(
-            ram.HEADROOM_BYTES, cast(int, policy.get("host_reserve_bytes") or 0)
-        )
     # Keep the policy alongside launch receipts for reproducibility.
     policy_path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
     parser = argparse.ArgumentParser()
@@ -148,11 +147,11 @@ def run(args: argparse.Namespace) -> int:
         host,
         "--port",
         str(args.port),
-        "--context",
-        str(args.context),
         "--output-dir",
         str(state / "runs" / uuid.uuid4().hex),
     ]
+    if args.context is not None:
+        command.extend(["--context", str(args.context)])
     for name in ("settings", "machine"):
         if getattr(args, name):
             command.extend(["--" + name, str(getattr(args, name))])

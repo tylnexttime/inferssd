@@ -1,19 +1,42 @@
 # Test gates
 
+Hosted CI runs the native tests labelled `ci`. On Linux, macOS and Windows it builds the target
+`inferssd-ci-tests` and runs `ctest -L ci`, which selects the `ci` tests that OS registers. On Linux the
+tests run in a systemd scope with an 8 GiB memory limit, which gives the RAM cache cases the finite cgroup v2
+limit they need. A test joins by calling `inferssd_ci_test(<executable target> <test>...)` next to its
+`add_test` in [engine/tests/CMakeLists.txt](../engine/tests/CMakeLists.txt); the workflow names no tests.
+A missing executable, a skipped test or zero selected tests fails the job.
+
+Left out of `ci`: tests that need a GPU, a model or the network; the store fixtures under
+`engine/tests/ssd/fixtures/c0-store` that link the test-only legacy runtime; and the bundled llama.cpp tests
+other than `test-reasoning-budget` and `test-kv-cache-grow`, which cover InferSSD changes. Where a hosted
+runner cannot run a test, CMake says so next to it: `graph_lane` counts only on macOS, the one runner with a
+GPU for the lane, and `test-kv-cache-grow`, `ssd_cpu_sink_cache_load` and `ssd_cpu_sink_work_reclaim` do not
+count on macOS.
+
 The `unit` CTest label contains only model-free tests that require neither a GPU
 nor cgroup setup. Build the targets before running `ctest -L unit`; a missing
-executable, skipped test or zero selected tests is not a passing gate. CI uses an
-explicit subset to keep the default check small. The CUDA workflow compiles the
+executable, skipped test or zero selected tests is not a passing gate. The CUDA workflow compiles the
 server for `sm_120a` and `sm_121a` on `main` and on pull requests that change the
 engine or build configuration; it does not establish GPU runtime correctness.
 Device runs must record both the selected and actually executed tests.
+
+The generic SSD tests use `test-ssd-*` for source files and executables, and
+`ssd_*` or the executable name for CTest. The SSD runtime's symbols, log prefixes
+(such as `[ssd_cpu_sink_cache]`) and CMake option (`GGML_CUDA_SSD_VRAM_TIER`) use
+`ssd` as well. The former `kimi` names came from the predecessor repository, whose
+runtime was first written for a Kimi model. Kimi model support and
+`test-kimi-deepseek2-guards` keep their model-specific names. Frozen launcher
+oracles, the recorded c0-store references and release-comparison sources retain
+their original names, paths and hashes, and the retired `GGML_KIMI_*` environment
+variables keep their names where the engine and the launcher refuse them.
 
 The CPU sink suite runs on Linux, macOS and Windows against the same ggml
 reference graphs, bit for bit. It exercises direct reads, the OS read ring
 (io_uring on Linux, IoRing on Windows), affinity, the host memory envelope and
 experimental scheduling paths; on Linux also cgroup memory limits. It is not
 interchangeable with the portable unit gate. Do not interpret a full-suite run on a small hosted runner as
-a production device acceptance test. GPU and cgroup suites need dedicated launchers
+a production device acceptance test. GPU suites need dedicated launchers
 and explicit resource prerequisites before they can become automated gates.
 
 Some bundled upstream tests in a full run depend on outside resources: `test-download-model`
@@ -28,8 +51,8 @@ needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unav
 static library that only llama links; each context owns its source index. The
 supported configuration uses bundled ggml, shared or static libraries, the CPU
 backend, and linked backends (`GGML_BACKEND_DL=OFF`, `GGML_CPU_ALL_VARIANTS=OFF`).
-The CUDA SSD transport (`GGML_CUDA_KIMI_VRAM_TIER=ON`, set by the `linux-cuda`
-preset) reads through the same read ring as the CPU sink, so no build needs
+The GPU SSD transport (`GGML_CUDA_SSD_VRAM_TIER=ON`, set by the `linux-cuda` and
+`linux-rocm` presets) reads through the same read ring as the CPU sink, so no build needs
 liburing: on Linux the ring submits io_uring requests through system calls. System-ggml and runtime backend-plugin variants remain
 outside this store's supported build boundary. Every OS runs configured experts
 through the store and the CPU sink. The OFF configuration is retained for explicit legacy
@@ -40,7 +63,7 @@ The legacy store fixtures below are Linux-only. `test-c0-store` and `test-c0-con
 compare it with a fixed test reference. `test-c0-parser-failures` injects
 allocation and callback failures into the parser to verify handle cleanup.
 Their CTest names `c0-store`, `c0-config` and `c0-parser-failures` carry `unit`
-and run in hosted CPU CI. The cross-DSO/mock-provider, source-open-hook and direct
+and `ci`. The cross-DSO/mock-provider, source-open-hook and direct
 I/O fixtures carry `device`; they do not silently join the hosted unit gate.
 The production store CMake target does not read the fixture's reference includes
 or execute Python. The fixed reference is copied only in the test configuration.
@@ -50,6 +73,22 @@ Successful shared initialization emits one receipt:
 Together with loaded-library hashes and direct-file descriptor identity, this
 records which provider populated the single owner. It is not a replacement for
 the finite-RAM same-sink numerical comparison or normal reader-shutdown checks.
+
+## CUDA handle allocation recovery
+
+On Linux shared CUDA builds, `test-ssd-cublas-retry` links the backend's real
+cuBLAS creation/reclaim helper and interposes `cublasCreate_v2` only inside the
+test executable. Eight deterministic cases cover success, repeated allocation
+failure followed by recovery, absent/busy/deferred reclaimers, zero progress,
+callback failure and non-allocation errors. Failed creates never publish a handle.
+The fixture does not exhaust device memory; it still selects a CUDA device, so
+run it explicitly on an owned GPU alongside `test-ssd-vram-group` and
+`test-ssd-vram-elastic`:
+
+```sh
+cmake --build build-linux-cuda --target test-ssd-cublas-retry
+build-linux-cuda/bin/test-ssd-cublas-retry
+```
 
 ## Device failures
 

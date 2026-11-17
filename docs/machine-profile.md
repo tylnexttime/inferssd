@@ -98,17 +98,14 @@ memory, the available memory) to choose:
   the GPU (it refines them as it runs);
 - `vram.budget = 0` when the engine has CUDA and no CUDA GPU is usable, and on
   macOS and Windows the host memory budget from the runtime policy;
-- with an engine that has CUDA and one usable CUDA GPU, which prompt passes the CPU prefills
-  (`prefill.cpu_max_tokens`, the longest pass the CPU prefills faster than the
-  GPU graph reading the same experts; a tie goes to the graph, which warms the
-  VRAM tier for decode) and one prefill pass per prompt; on
+- with an engine that has CUDA and one usable CUDA GPU, one prefill pass per prompt; on
   a GPU sharing host memory, a host margin of 4096 MiB (`host.headroom_mib`).
 
 Without a measurement of the model's weight format, both pools take every
 allowed CPU but one.
 
-Only the prefill route and the pass size change the model's output, the way
-any GPU kernel or batch shape does; the rest keeps it bit for bit. The launch fills only the settings
+Only the pass size changes the model's output, the way
+any batch shape does; the rest keeps it bit for bit. The launch fills only the settings
 you left at their defaults: a value from `--set` or from the settings file always
 wins, and a choice that contradicts one of your values is left out. Every choice and its reason is written to `strategy.json` in the run
 directory and to the settings file the launch generates.
@@ -120,21 +117,25 @@ directory and to the settings file the launch generates.
 | `cpu` | sysfs on Linux, `sysctl` on macOS, CPU Sets on Windows; ISA from `inferssd-cpuprobe` | Logical CPUs with core, package, SMT siblings, `cpu_capacity` and maximum frequency; performance and efficiency clusters; whether threads can be pinned; the instruction-set features ggml reports (build options such as OpenMP or repacking are left out) |
 | `memory` | `/proc/meminfo`, `hw.memsize` or `GlobalMemoryStatusEx`; `inferssd-cpuprobe` | Total memory, page size, whether the GPU shares system memory, DRAM read bandwidth per thread count |
 | `compute` | `inferssd-cpuprobe` | ggml CPU matrix-multiply speed per weight format at 1, 2, 4, ... threads up to every CPU, at the performance cluster's size and at every CPU but one: weight bytes per second for one token, FLOP/s for more tokens, with each point's median call and quartiles; on Linux machines with several CPU clusters, also one token with a thread pinned to each CPU of each cluster and of every CPU, and on the performance cluster's first 1, 2, 4, ... CPUs (rows with `cpus`) |
-| `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU `nvidia-smi` lists |
+| `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs, or AMD GPUs on ROCm) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU the engine's CUDA or ROCm runtime finds |
 | `storage:<drive>` | `inferssd-ssdprobe`, one per drive | Random-read bandwidth and latency by request size and queue depth, read with the engine's own reader; the knee queue depth per size |
 
 The identity lists the GPUs, each with the backend the engine runs it on: the
-NVIDIA GPUs `nvidia-smi` reports, on CUDA; on macOS the Apple GPU with its core
-count as `ioreg` reports it, on Metal (when `ioreg` cannot say, the list is
-empty and profiling continues); and the AMD and Intel display controllers, on
-Vulkan, found on the PCI bus on Linux and among the display adapters in the
-registry on Windows. Other display controllers, such as a server's management
-display or a virtual machine's, are left out. The installers build the engine for
-the first of CUDA, Metal and Vulkan among these GPUs, and for the CPU alone when
-there is none. The GPU probe measures every
-GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`; on macOS the GPU shares the
+NVIDIA GPUs `nvidia-smi` reports, on CUDA; on Linux with ROCm installed (its
+`rocminfo` on PATH), the AMD GPUs the kernel's compute driver amdkfd lists
+(`/sys/class/kfd/kfd/topology`), on ROCm, by ROCm's UUIDs (`GPU-` and the
+device's unique ID in hex, as `rocminfo` and HIP spell them); on macOS the Apple GPU
+with its core count as `ioreg` reports it, on Metal (when `ioreg` cannot say, the
+list is empty and profiling continues); and the other AMD and the Intel display
+controllers, on Vulkan, found on the PCI bus on Linux and among the display
+adapters in the registry on Windows. Other display controllers, such as a server's
+management display or a virtual machine's, are left out. CUDA and ROCm carry the
+expert VRAM tier. The installers build the engine for the first of CUDA, ROCm,
+Metal and Vulkan among these GPUs, and for the CPU alone when there is none. The
+GPU probe measures every GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`,
+`HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`; on macOS the GPU shares the
 machine's memory and is not measured. A GPU the probe cannot measure (too
-little free VRAM, or a CUDA error) makes the `gpus` section partial, with the
+little free VRAM, or a runtime error) makes the `gpus` section partial, with the
 GPU's UUID and the reason. When `nvidia-smi` is
 installed but fails, for example after a driver upgrade without a reboot, the
 `gpus` section fails and the saved GPU identity is kept, so the machine is not
@@ -190,6 +191,13 @@ probe fails. It needs 5 GiB free there. The file's name
 read as model files, and the next run removes those whose process has ended.
 When no such directory is given, or there is not enough room, the drive's section
 is recorded as failed with the reason.
+
+The test file is also used when every given file is already in the page cache,
+which is how a model looks right after its download on a Mac with memory to
+spare: the probe skips cached pages on macOS, since reading them would measure
+memory, and it finds nothing left to read. The file is written beside the model
+and needs the same 5 GiB free there; without that room the section is recorded
+as failed, and a later run measures the drive once the pages have been evicted.
 
 A drive is identified by its model and a digest of its serial number, or by
 its kernel name when it reports no serial (common for virtual disks). On Linux

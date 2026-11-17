@@ -35,7 +35,6 @@ from inferssd.strategy.derive import (
     launch_conflicts,
     literal,
     offered,
-    prefill_split,
     prefill_threads,
 )
 from inferssd.strategy.inputs import GPUState, RuntimeFacts, model_facts
@@ -113,11 +112,9 @@ def test_x86_uniform_machine_with_a_discrete_gpu(models):
     assert terms["drive_gbps"] == pytest.approx(9.623315)
     assert "4 MiB reads at QD 16" in s.settings["place.costs"].reason
     assert s.server_args == SERVER_ARGS == ("--ctx-checkpoints", "1")
-    # The 5090 graph reads at the drive's rate, slower than its link, so the CPU
-    # is never faster: every pass goes to the graph, each prompt in one pass.
-    assert s.settings["prefill.cpu_max_tokens"].value_text == "0"
-    assert "GPU graph reading 9.62 GB/s" in s.settings["prefill.cpu_max_tokens"].reason
-    assert s.one_pass
+    # Every pass takes the engine's SSD sink, each prompt in one pass.
+    assert any(note.startswith("prefill: the SSD sink for every pass") for note in s.notes)
+    assert any(note.startswith("prefill: one pass a prompt") for note in s.notes)
     assert "host.headroom_mib" not in s.settings  # a discrete GPU
     assert s.inputs.platform == "linux"
     assert s.inputs.model_paths == models["dsv"].paths
@@ -251,9 +248,7 @@ def test_arm_unified_memory(models):
     assert "vram.budget" not in s.settings
     assert any(note.startswith("vram.budget: default auto for ") for note in s.notes)
     assert s.settings["host.headroom_mib"].value_text == "4096"
-    # The graph reads at the drive's rate too: every pass goes to the GPU.
-    assert s.settings["prefill.cpu_max_tokens"].value_text == "0"
-    assert s.one_pass
+    assert any(note.startswith("prefill: one pass a prompt") for note in s.notes)
 
 
 def two_clusters(fast, slow):
@@ -486,34 +481,6 @@ def test_decode_on_the_first_cpus_of_the_performance_cluster(models):
     assert launch_conflicts(s.threads, (), 0, "linux") == []
 
 
-def test_prefill_split_crossing(models):
-    dsv = models["dsv"]
-    line = (176.7, 114.28)
-    # A tie goes to the graph, which leaves the experts in the VRAM tier for decode.
-    split, why = prefill_split(dsv, line, 11.85, 11.85)
-    assert split == 0 and "40 layers of 384 experts, 6 a token" in why
-
-    # A link slower than the drive leaves the CPU the short passes, up to the crossing.
-    split, _ = prefill_split(dsv, line, 11.85, 5.0)
-
-    def seconds(n, graph):
-        touched = dsv.layers * dsv.experts * (1 - (1 - 6 / dsv.experts) ** n)
-        if graph:
-            return touched * dsv.expert_read_bytes / 5.0e9
-        read = touched * dsv.expert_read_bytes / 11.85e9
-        return max(read, (touched * line[0] + n * 6 * dsv.layers * line[1]) * 1e-6)
-
-    assert split > 0
-    assert seconds(split, False) < seconds(split, True)
-    assert seconds(split + 1, False) >= seconds(split + 1, True)
-    # A slower link makes the graph slower: the CPU keeps longer passes.
-    assert prefill_split(dsv, line, 11.85, 3.0)[0] > split
-    # A CPU that is slower even for one token leaves every pass to the graph.
-    assert prefill_split(dsv, (1e6, 1e6), 11.85, 5.0)[0] == 0
-    # A CPU that is never slower within the bound leaves the engine's default.
-    assert prefill_split(dsv, (0.0, 0.0), 11.85, 5.0)[0] is None
-
-
 def test_affinity_limits_the_threads_and_the_cpu_line(models):
     c = machine(X86)
     s = derive(c, models["dsv"], runtime([3, 4, 5, 6, 7, 99]), "linux", model_drive_key=None)
@@ -612,6 +579,40 @@ def test_the_cuda_budget_follows_the_engine_not_the_platform(models):
     s = derive(c, models["dsv"], facts, "windows", model_drive_key=drive(c))
     assert s.settings["vram.budget"].value_text == "0"
     assert s.settings["vram.budget"].reason == "no CUDA GPU is usable now"
+
+
+def test_the_vram_tier_budget_follows_the_engines_tier_backend(models):
+    # The profiled GPU as an AMD card on ROCm: a ROCm engine sizes its tier as a CUDA one does.
+    c = machine(X86)
+    amd = "GPU-b8dff1e274ce6c9f"
+    c["identity"]["hard"]["gpus"] = [
+        dict(c["identity"]["hard"]["gpus"][0], backend="ROCm", uuid=amd)
+    ]
+    c["gpus"] = [dict(c["gpus"][0], uuid=amd)]
+    facts = runtime(range(61), [GPUState(amd, 30 << 30, 0, "ROCm")], backends=("ROCm",))
+    s = derive(c, models["dsv"], facts, "linux", model_drive_key=drive(c))
+    assert "vram.budget" not in s.settings
+    assert f"vram.budget: default auto for {amd}" in s.notes
+    assert "link_gbps" in costs(s)
+    busy = runtime(range(61), [GPUState(amd, 30 << 30, 1, "ROCm")], backends=("ROCm",))
+    s = derive(c, models["dsv"], busy, "linux", model_drive_key=drive(c))
+    assert "vram.reserve_mib" in s.settings
+    nothing = runtime(range(61), backends=("ROCm",))
+    s = derive(c, models["dsv"], nothing, "linux", model_drive_key=drive(c))
+    assert (
+        s.settings["vram.budget"].reason == "no ROCm GPU is usable now, although the machine has 1"
+    )
+    # An engine's tier uses its own backend's GPUs only: a CUDA engine leaves an AMD GPU out.
+    c = machine(X86)
+    both = [GPUState(X86_GPU, 30 << 30, 0), GPUState(amd, 30 << 30, 0, "ROCm")]
+    s = derive(
+        c,
+        models["dsv"],
+        runtime(range(61), both, backends=("CUDA",)),
+        "linux",
+        model_drive_key=drive(c),
+    )
+    assert f"vram.budget: default auto for {X86_GPU}" in s.notes and "link_gbps" in costs(s)
 
 
 def test_gpu_states_that_leave_the_vram_budget_alone(models):
@@ -743,7 +744,7 @@ def test_experts_mixing_formats_across_layers_use_the_gpu_tier(tmp_path, experts
     gpu = GPUState(X86_GPU, 30 << 30, 0)
     s = derive(c, mixed, runtime(range(61), [gpu]), "linux", model_drive_key=drive(c))
     assert "vram.budget" not in s.settings
-    assert s.one_pass and "prefill.cpu_max_tokens" in s.settings
+    assert any(note.startswith("prefill: one pass a prompt") for note in s.notes)
 
 
 WINDOWS = "windows-x64-igpu.json"  # 4 + 4 Intel cores with an integrated GPU, one NVMe drive
@@ -766,7 +767,7 @@ def test_windows_runs_the_one_derivation(models):
     assert s.threads.batch == 7 and s.threads.decode_cpus in ((), (0, 1, 2, 3))
     terms = costs(s)
     assert "link_gbps" not in terms and terms["drive_gbps"] > 0
-    assert not s.one_pass
+    assert any(note.startswith("prefill: one pass a prompt") for note in s.notes)
 
 
 @pytest.mark.parametrize(

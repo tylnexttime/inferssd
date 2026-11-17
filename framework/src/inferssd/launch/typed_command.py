@@ -21,7 +21,7 @@ from typing import Optional
 from inferssd.configuration.settings import PLATFORMS, cpus, host_platform
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts, run_indexer
-from inferssd.launch.resources import read_resources
+from inferssd.launch.resources import cache_directory, read_resources
 from inferssd.launch.typed import (
     BATCH,
     CONTEXT,
@@ -83,18 +83,21 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "0.0.0.0 every network interface",
     )
     launch.add_argument("--port", type=int, default=8080)
-    launch.add_argument("--context", type=int, help=f"-c (default: {CONTEXT})")
+    launch.add_argument(
+        "--context",
+        type=int,
+        help="-c (default: the largest multiple of 8192, up to the model's trained context, "
+        f"that memory holds when full; up to {CONTEXT} for a RAM-only model)",
+    )
     launch.add_argument(
         "--batch",
         type=int,
-        help=f"-b (default: the context where the strategy prefills a prompt in one pass, "
-        f"else {BATCH})",
+        help=f"-b (default: the context with the launch strategy, else {BATCH})",
     )
     launch.add_argument(
         "--ubatch",
         type=int,
-        help=f"-ub (default: --batch where the strategy prefills a prompt in one pass, "
-        f"else {BATCH})",
+        help=f"-ub (default: --batch with the launch strategy, else {BATCH})",
     )
     launch.add_argument(
         "--threads", type=int, help="decode ggml threads, -t (1..256; default: the server's)"
@@ -132,13 +135,7 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
 
 def prompt_cache_directory() -> Path:
     """This user's cache directory for inferssd prompt caches."""
-    if sys.platform == "darwin":
-        root = Path.home() / "Library" / "Caches"
-    elif sys.platform == "win32":
-        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    else:
-        root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return root / "inferssd" / "prompts"
+    return cache_directory() / "prompts"
 
 
 def specification(args: argparse.Namespace, *, strategy: bool = False) -> LaunchSpec:

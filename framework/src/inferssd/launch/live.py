@@ -21,6 +21,7 @@ from inferssd.launch.linux import cpu_count
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cmake_gpu_backends
 from inferssd.launch.types import Fact, LaunchInput, Reply
+from inferssd.machine.identity import KFD_NODES
 from inferssd.platform.captured_command import run_captured
 from inferssd.strategy import inputs as strategy_inputs
 
@@ -99,17 +100,20 @@ class LiveArtifacts:
         python: str,
         machine: Optional[str] = None,
         strategy_host: Optional[strategy_inputs.Host] = None,
+        index_cache: Optional[Path] = None,
     ) -> None:
         """MACHINE: the characteristics text the launch strategy derives from, if any.
 
         STRATEGY_HOST reads the strategy's runtime facts; by default this host,
-        with the launch's environment.
+        with the launch's environment. INDEX_CACHE keeps expert indexes for later launches.
         """
         self.inputs, self.host = inputs, host
         self.run, self.replace, self.python = run, replace, python
         self.machine = machine
         self.strategy_host = strategy_host or strategy_inputs.NativeHost(dict(inputs.environment))
-        self.artifacts = RecordedArtifacts(inputs, {}, run=run, replace=replace, python=python)
+        self.artifacts = RecordedArtifacts(
+            inputs, {}, run=run, replace=replace, python=python, index_cache=index_cache
+        )
 
     def __call__(self, fact: Fact) -> Reply:
         if fact.name == "machine_characteristics":
@@ -132,8 +136,11 @@ class LiveArtifacts:
 
     def value(self, fact: Fact) -> object:
         name, args, host = fact.name, fact.arguments, self.host
-        if name in ("gpu_available", "ss_available"):
-            return host.which("nvidia-smi" if name == "gpu_available" else "ss")
+        if name == "gpu_available":
+            # The VRAM tier's GPUs can be read: NVIDIA's through nvidia-smi, AMD's through amdkfd.
+            return host.which("nvidia-smi") or host.exists(KFD_NODES)
+        if name == "ss_available":
+            return host.which("ss")
         if name == "gpu_memory":
             result = host.command(
                 ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]
